@@ -1,0 +1,4 @@
+model,embedding_time,num_nodes,num_edges,dataset
+TADW,1.7966656684875488,2485,5069,cora
+SINE,29.589773893356323,2485,5069,cora
+DeepWalk,4.897830009460449,2485,5069,cora
