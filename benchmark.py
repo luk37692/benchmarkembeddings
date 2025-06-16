@@ -33,10 +33,12 @@ import networkx as nx
 import numpy as np
 import time
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.preprocessing import LabelEncoder
+import psutil
+import os
 
 from karateclub import TADW, SINE, DeepWalk
 
@@ -166,7 +168,7 @@ def load_node_labels(dataset_name):
         return pd.DataFrame({'node': nodes, 'label': labels})
 
 
-def evaluate_embedding(embeddings, labels_df, nodes):
+def evaluate_embedding(embeddings, labels_df, nodes, n_splits=5):
     """
     Evaluate embeddings using node classification
     """
@@ -195,42 +197,50 @@ def evaluate_embedding(embeddings, labels_df, nodes):
         le = LabelEncoder()
         y = le.fit_transform(y)
     
-    # Split data
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y
-        )
-    except ValueError:
-        # If stratification fails, use simple split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42
-        )
-    
-    # Train classifier
-    clf = LogisticRegression(random_state=42, max_iter=1000)
-    clf.fit(X_train, y_train)
-    
-    # Predictions
-    y_pred = clf.predict(X_test)
-    y_prob = clf.predict_proba(X_test)
-    
-    # Calculate metrics
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    acc, f1_macro, f1_micro, f1_weighted = [], [], [], []
+    prec, rec, roc, train_times = [], [], [], []
+    mem_usage = []
+    process = psutil.Process(os.getpid())
+
+    for train_idx, test_idx in skf.split(X, y):
+        start_time = time.time()
+        clf = LogisticRegression(random_state=42, max_iter=1000)
+        clf.fit(X[train_idx], y[train_idx])
+        train_times.append(time.time() - start_time)
+        mem_usage.append(process.memory_info().rss)
+
+        y_pred = clf.predict(X[test_idx])
+        y_prob = clf.predict_proba(X[test_idx])
+
+        acc.append(accuracy_score(y[test_idx], y_pred))
+        f1_macro.append(f1_score(y[test_idx], y_pred, average='macro'))
+        f1_micro.append(f1_score(y[test_idx], y_pred, average='micro'))
+        f1_weighted.append(f1_score(y[test_idx], y_pred, average='weighted'))
+        prec.append(precision_score(y[test_idx], y_pred, average='weighted'))
+        rec.append(recall_score(y[test_idx], y_pred, average='weighted'))
+
+        try:
+            if len(np.unique(y)) == 2:
+                roc.append(roc_auc_score(y[test_idx], y_prob[:, 1]))
+            else:
+                roc.append(roc_auc_score(y[test_idx], y_prob, multi_class='ovr'))
+        except Exception:
+            roc.append(np.nan)
+
     metrics = {
-        'accuracy': accuracy_score(y_test, y_pred),
-        'f1_score': f1_score(y_test, y_pred, average='weighted'),
-        'precision': precision_score(y_test, y_pred, average='weighted'),
-        'recall': recall_score(y_test, y_pred, average='weighted'),
+        'accuracy': float(np.mean(acc)),
+        'f1_macro': float(np.mean(f1_macro)),
+        'f1_micro': float(np.mean(f1_micro)),
+        'f1_weighted': float(np.mean(f1_weighted)),
+        'precision': float(np.mean(prec)),
+        'recall': float(np.mean(rec)),
+        'roc_auc': float(np.nanmean(roc)),
+        'train_time': float(np.sum(train_times)),
+        'train_memory_mb': float(max(mem_usage) / 1e6)
     }
-    
-    # ROC AUC (handle multiclass)
-    try:
-        if len(np.unique(y)) == 2:
-            metrics['roc_auc'] = roc_auc_score(y_test, y_prob[:, 1])
-        else:
-            metrics['roc_auc'] = roc_auc_score(y_test, y_prob, multi_class='ovr')
-    except:
-        metrics['roc_auc'] = None
-    
+
     return metrics
 
 
@@ -240,11 +250,13 @@ def benchmark_model(model_name, embedding_func, graph, labels_df):
     """
     print(f"\nBenchmarking {model_name}...")
     
-    # Measure embedding time
+    process = psutil.Process(os.getpid())
     start_time = time.time()
+    start_mem = process.memory_info().rss
     try:
         embeddings = embedding_func(graph)
         embedding_time = time.time() - start_time
+        embedding_mem = (process.memory_info().rss - start_mem) / 1e6
         
         # Get node list (assuming embeddings are in node order)
         nodes = list(graph.nodes())
@@ -255,6 +267,7 @@ def benchmark_model(model_name, embedding_func, graph, labels_df):
         result = {
             'model': model_name,
             'embedding_time': embedding_time,
+            'embedding_memory_mb': embedding_mem,
             'num_nodes': len(nodes),
             'num_edges': graph.number_of_edges()
         }
@@ -281,8 +294,8 @@ def main():
     """
     Run complete benchmark across all models and datasets
     """
-    # Only test datasets that actually exist
-    datasets = ["cora"]  # Only cora is available
+    # Datasets to benchmark
+    datasets = ["cora", "dblp", "nyt"]
     models = [
         ("TADW", tadw_embedding),
         ("SINE", sine_embedding),
