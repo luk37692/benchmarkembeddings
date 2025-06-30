@@ -1,363 +1,414 @@
-"""
-This code benchmarks the performance of embedding models
-models
-- tadw
-- sine
-- deepwalk
+#!/usr/bin/env python
+# coding: utf-8
 
-
-We will use the following datasets:
-- cora
-- dblp
-- nyt
-
-We will use the following metrics:
-- accuracy
-- f1 score
-- precision
-- recall
-- roc auc score
-
-
-using Karate Club library models
-
-
-
-
-
-
-
-"""
-
-import networkx as nx
-import numpy as np
-import time
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.preprocessing import LabelEncoder
-import psutil
-import os
+import numpy as np
+from utils import read_data
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize
+from sklearn.feature_extraction.text import TfidfVectorizer
+from models import train_rle, train_geld, train_tadw, prepare_data
+import networkx as nx
+from semantic_fracture import SemanticFractureEvaluator
 
-from karateclub import TADW, SINE, DeepWalk
+# Configuration
+methods = ["BASELINE_TFIDF", "RLE", "GELD", "SINE", "MUSAE", "TADW"]  # Ajout baseline
+dataset = "cora2"
+d = 160
+k = 5  # Number of similar documents to retrieve
+
+print(f"\nLoading {dataset}...")
+# Load data
+tf_idf, groups, A, graph, voc, raw, tf = read_data(dataset)
+n = A.shape[0]
+print(f"{n} nodes, {tf_idf.shape[1]} features, {len(graph.edges())} edges")
+
+# Prepare and learn embeddings
+data_graph, data_text, sigma_init, D_init, U = prepare_data(d, tf, A, voc, raw)
+embeddings = {}
+
+# 1. BASELINE: TF-IDF pur (sans structure de graphe)
+print("\n" + "="*50)
+print("BASELINE: TF-IDF (sans liens)")
+print("="*50)
+# Réduire les dimensions pour comparaison équitable
+from sklearn.decomposition import TruncatedSVD
+svd = TruncatedSVD(n_components=d, random_state=42)
+tfidf_reduced = svd.fit_transform(tf_idf)
+embeddings["BASELINE_TFIDF"] = normalize(tfidf_reduced, norm='l2', axis=1)
+print(f"Baseline TF-IDF embeddings shape: {embeddings['BASELINE_TFIDF'].shape}")
+
+# 2. Méthodes avec liens (votre code existant)
+if "GELD" in methods:
+    alpha_map = {"cora2": 0.99, "dblp": 0.8, "nyt": 0.95}
+    D, D_norm, sigma = train_geld(
+        d, data_graph, data_text, U, D_init, sigma_init,
+        n_epoch=40, lamb=None, alpha=alpha_map[dataset]
+    )
+    embeddings["GELD"] = normalize(D_norm, norm='l2', axis=1)
+
+    # Normalize GELD embeddings
+    embeddings["GELD"] = normalize(D_norm, norm='l2', axis=1)
+    print("\nGELD embeddings (normalized):")
+    print(embeddings["GELD"])
+    print(f"GELD embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['GELD'][0]):.4f}")
+
+if "RLE" in methods:
+    window_map = {"cora2": 15, "dblp": 5, "nyt": 10}
+    rle_embeddings, _ = train_rle(A, tf, U, d, 0.7, verbose=True)
+    # Normalize RLE embeddings
+    embeddings["RLE"] = normalize(rle_embeddings, norm='l2', axis=1)
+    print("\nRLE embeddings (normalized):")
+    print(embeddings["RLE"])
+    print(f"RLE embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['RLE'][0]):.4f}")
+
+if "MUSAE" in methods:
+    print("\nTraining MUSAE embeddings...")
+    from karateclub import MUSAE
+
+    # Convert TF-IDF features to the format expected by Karate Club
+    # Karate Club SINE expects a scipy sparse COO matrix for features
+    if hasattr(tf_idf, 'tocoo'):
+        feature_matrix = tf_idf.tocoo()
+    else:
+        from scipy.sparse import coo_matrix
+        feature_matrix = coo_matrix(tf_idf)
+
+    musae_model = MUSAE(
+        dimensions=d,
+        epochs=10,
+        learning_rate=0.01,
+        seed=42
+    )
+    musae_model.fit(graph, feature_matrix)
+    musae_embeddings = musae_model.get_embedding()
+    # Normalize MUSAE embeddings
+    embeddings["MUSAE"] = normalize(musae_embeddings, norm='l2', axis=1)
+    print("\nMUSAE embeddings (normalized):")
+    print(embeddings["MUSAE"])
+    print(f"MUSAE embeddings shape: {embeddings['MUSAE'].shape}")
+    print(f"MUSAE embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['MUSAE'][0]):.4f}")
 
 
-def tadw_embedding(graph):
-    """
-    """
-    # Use synthetic features with more dimensions
-    num_nodes = graph.number_of_nodes()
-    # Create features with degree, clustering coefficient, and random features
-    degrees = dict(graph.degree())
-    clustering = nx.clustering(graph)
+if "TADW" in methods:
+    print("\nTraining TADW embeddings...")
     
-    # Create feature matrix with sufficient dimensions (minimum 64 for TADW with 64 dimensions)
-    features = []
-    for i in range(num_nodes):
-        node_features = [
-            degrees[i], 
-            degrees[i]**2, 
-            clustering[i],
-            degrees[i] * clustering[i]
-        ]
-        # Add random features to reach 64 dimensions
-        node_features.extend(np.random.rand(60).tolist())
-        features.append(node_features)
-    
-    features = np.array(features)
-    tadw = TADW(dimensions=32, iterations=5)  # Reduced dimensions
-    tadw.fit(graph, features)
-    return tadw.get_embedding()
-
-
-def sine_embedding(graph):
-    """
-    """
-    from scipy.sparse import coo_matrix
-    
-    # Use synthetic features in sparse format
-    num_nodes = graph.number_of_nodes()
-    degrees = dict(graph.degree())
-    clustering = nx.clustering(graph)
-    
-    # Create feature matrix
-    features = []
-    for i in range(num_nodes):
-        node_features = [
-            degrees[i], 
-            degrees[i]**2, 
-            clustering[i],
-            degrees[i] * clustering[i]
-        ]
-        # Add random features to reach decent dimensions
-        node_features.extend(np.random.rand(60).tolist())
-        features.append(node_features)
-    
-    features = np.array(features)
-    # Convert to sparse matrix format
-    features_sparse = coo_matrix(features)
-    
-    sine = SINE(dimensions=32, epochs=1)  # Reduced dimensions
-    sine.fit(graph, features_sparse)
-    return sine.get_embedding()
-
-
-def deepwalk_embedding(graph):
-    """
-    """
-    deepwalk = DeepWalk(dimensions=32, workers=4, epochs=1)  # Reduced to match other models
-    deepwalk.fit(graph)
-    return deepwalk.get_embedding()
-
-
-def load_dataset(dataset_name):
-    """
-    """
-    if dataset_name == "cora":
-        graph = nx.read_edgelist("dataset/cora/graph.txt", create_using=nx.Graph())
-        # Relabel nodes to consecutive integers starting from 0
-        mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-        graph = nx.relabel_nodes(graph, mapping)
-        return graph
-    elif dataset_name == "dblp":
-        graph = nx.read_edgelist("dataset/dblp/graph.txt", create_using=nx.Graph())
-        mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-        graph = nx.relabel_nodes(graph, mapping)
-        return graph
-    elif dataset_name == "nyt":
-        graph = nx.read_edgelist("dataset/nyt/graph.txt", create_using=nx.Graph())
-        mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-        graph = nx.relabel_nodes(graph, mapping)
-        return graph
-
-
-def load_node_labels(dataset_name):
-    """
-    Load node labels for evaluation (assumes labels files exist)
-    """
-    try:
-        if dataset_name == "cora":
-            labels_df = pd.read_csv("dataset/cora/group.txt", sep='\t', header=None, names=['node', 'label'])
-            # Map original node IDs to new consecutive IDs
-            graph = nx.read_edgelist("dataset/cora/graph.txt", create_using=nx.Graph())
-            mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-            labels_df['node'] = labels_df['node'].map(mapping)
-            labels_df = labels_df.dropna()  # Remove unmapped nodes
-            return labels_df
-        elif dataset_name == "dblp":
-            labels_df = pd.read_csv("dataset/dblp/group.txt", sep='\t', header=None, names=['node', 'label'])
-            graph = nx.read_edgelist("dataset/dblp/graph.txt", create_using=nx.Graph())
-            mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-            labels_df['node'] = labels_df['node'].map(mapping)
-            labels_df = labels_df.dropna()
-            return labels_df
-        elif dataset_name == "nyt":
-            labels_df = pd.read_csv("dataset/nyt/group.txt", sep='\t', header=None, names=['node', 'label'])
-            graph = nx.read_edgelist("dataset/nyt/graph.txt", create_using=nx.Graph())
-            mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-            labels_df['node'] = labels_df['node'].map(mapping)
-            labels_df = labels_df.dropna()
-            return labels_df
-    except FileNotFoundError:
-        print(f"Warning: No labels file found for {dataset_name}. Generating synthetic labels.")
-        # Generate synthetic labels for demonstration
-        graph = load_dataset(dataset_name)
-        nodes = list(graph.nodes())
-        labels = np.random.randint(0, 5, len(nodes))  # 5 classes
-        return pd.DataFrame({'node': nodes, 'label': labels})
-
-
-def evaluate_embedding(embeddings, labels_df, nodes, n_splits=5):
-    """
-    Evaluate embeddings using node classification
-    """
-    # Ensure we have the right number of embeddings for the nodes
-    if len(embeddings) != len(nodes):
-        print(f"Mismatch: {len(embeddings)} embeddings vs {len(nodes)} nodes")
-        return None
-        
-    # Filter labels to only include nodes present in current graph
-    valid_labels = labels_df[labels_df['node'] < len(nodes)].copy()
-    
-    if len(valid_labels) < 10:
-        print("Warning: Not enough labeled nodes for evaluation")
-        return None
-    
-    # Get embeddings and labels for valid nodes
-    X = embeddings[valid_labels['node'].values]
-    y = valid_labels['label'].values
-    
-    if len(X) < 10:
-        print("Warning: Not enough matching nodes for evaluation")
-        return None
-        
-    # Encode labels if they're strings
-    if y.dtype == 'object':
-        le = LabelEncoder()
-        y = le.fit_transform(y)
-    
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-    acc, f1_macro, f1_micro, f1_weighted = [], [], [], []
-    prec, rec, roc, train_times = [], [], [], []
-    mem_usage = []
-    process = psutil.Process(os.getpid())
-
-    for train_idx, test_idx in skf.split(X, y):
-        start_time = time.time()
-        clf = LogisticRegression(random_state=42, max_iter=1000)
-        clf.fit(X[train_idx], y[train_idx])
-        train_times.append(time.time() - start_time)
-        mem_usage.append(process.memory_info().rss)
-
-        y_pred = clf.predict(X[test_idx])
-        y_prob = clf.predict_proba(X[test_idx])
-
-        acc.append(accuracy_score(y[test_idx], y_pred))
-        f1_macro.append(f1_score(y[test_idx], y_pred, average='macro'))
-        f1_micro.append(f1_score(y[test_idx], y_pred, average='micro'))
-        f1_weighted.append(f1_score(y[test_idx], y_pred, average='weighted'))
-        prec.append(precision_score(y[test_idx], y_pred, average='weighted'))
-        rec.append(recall_score(y[test_idx], y_pred, average='weighted'))
-
-        try:
-            if len(np.unique(y)) == 2:
-                roc.append(roc_auc_score(y[test_idx], y_prob[:, 1]))
-            else:
-                roc.append(roc_auc_score(y[test_idx], y_prob, multi_class='ovr'))
-        except Exception:
-            roc.append(np.nan)
-
-    metrics = {
-        'accuracy': float(np.mean(acc)),
-        'f1_macro': float(np.mean(f1_macro)),
-        'f1_micro': float(np.mean(f1_micro)),
-        'f1_weighted': float(np.mean(f1_weighted)),
-        'precision': float(np.mean(prec)),
-        'recall': float(np.mean(rec)),
-        'roc_auc': float(np.nanmean(roc)),
-        'train_time': float(np.sum(train_times)),
-        'train_memory_mb': float(max(mem_usage) / 1e6)
+    # TADW hyperparameters based on dataset
+    tadw_params = {
+        "cora2": {"order": 2, "iter_max": 5, "lamb": 0.2},
+        "dblp": {"order": 2, "iter_max": 20, "lamb": 0.1}, 
+        "nyt": {"order": 2, "iter_max": 15, "lamb": 0.15}
     }
-
-    return metrics
-
-
-def benchmark_model(model_name, embedding_func, graph, labels_df):
-    """
-    Benchmark a single model
-    """
-    print(f"\nBenchmarking {model_name}...")
     
-    process = psutil.Process(os.getpid())
-    start_time = time.time()
-    start_mem = process.memory_info().rss
+    params = tadw_params.get(dataset, {"order": 2, "iter_max": 15, "lamb": 0.2})
+    
+    # Train TADW model
+    tadw_embeddings, training_time = train_tadw(
+        A, tf_idf, d=d, 
+        order=params["order"],
+        iter_max=params["iter_max"], 
+        lamb=params["lamb"],
+        verbose=True
+    )
+    
+    # Normalize TADW embeddings
+    embeddings["TADW"] = normalize(tadw_embeddings, norm='l2', axis=1)
+    print("\nTADW embeddings (normalized):")
+    print(embeddings["TADW"])
+    print(f"TADW embeddings shape: {embeddings['TADW'].shape}")
+    print(f"TADW embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['TADW'][0]):.4f}")
+
+
+if "SINE" in methods:
+    print("\nTraining SINE embeddings...")
+    
+    # Use Karate Club SINE implementation
     try:
-        embeddings = embedding_func(graph)
-        embedding_time = time.time() - start_time
-        embedding_mem = (process.memory_info().rss - start_mem) / 1e6
+        from karateclub import SINE
         
-        # Get node list (assuming embeddings are in node order)
-        nodes = list(graph.nodes())
+        print("Using Karate Club SINE implementation...")
         
-        # Evaluate embeddings
-        metrics = evaluate_embedding(embeddings, labels_df, nodes)
-        
-        result = {
-            'model': model_name,
-            'embedding_time': embedding_time,
-            'embedding_memory_mb': embedding_mem,
-            'num_nodes': len(nodes),
-            'num_edges': graph.number_of_edges()
-        }
-        
-        if metrics:
-            result.update(metrics)
+        # Convert TF-IDF features to the format expected by Karate Club
+        # Karate Club SINE expects a scipy sparse COO matrix for features
+        if hasattr(tf_idf, 'tocoo'):
+            feature_matrix = tf_idf.tocoo()
         else:
-            print(f"Could not evaluate {model_name} - insufficient labeled data")
-            
-        return result
+            from scipy.sparse import coo_matrix
+            feature_matrix = coo_matrix(tf_idf)
         
-    except Exception as e:
-        print(f"Error with {model_name}: {str(e)}")
-        return {
-            'model': model_name,
-            'error': str(e),
-            'embedding_time': None,
-            'num_nodes': graph.number_of_nodes(),
-            'num_edges': graph.number_of_edges()
-        }
-
-
-def main():
-    """
-    Run complete benchmark across all models and datasets
-    """
-    # Datasets to benchmark
-    datasets = ["cora", "dblp", "nyt"]
-    models = [
-        ("TADW", tadw_embedding),
-        ("SINE", sine_embedding),
-        ("DeepWalk", deepwalk_embedding)
-    ]
+        # Initialize SINE model with correct parameters
+        sine_model = SINE(
+            walk_number=10,        # Number of random walks
+            walk_length=80,        # Length of random walks  
+            dimensions=d,          # Embedding dimensions
+            workers=4,             # Number of cores
+            window_size=5,         # Matrix power order
+            epochs=20,              # Number of epochs
+            learning_rate=0.01,    # HogWild! learning rate
+            min_count=1,           # Minimal count of node occurrences
+            seed=42                # Random seed value
+        )
+        
+        # Fit the model - SINE expects graph and feature matrix
+        sine_model.fit(graph, feature_matrix)
+        
+        # Get embeddings and normalize
+        sine_embeddings = sine_model.get_embedding()
+        embeddings["SINE"] = normalize(sine_embeddings, norm='l2', axis=1)
+        
+        print(f"SINE embeddings shape: {embeddings['SINE'].shape}")
+        print(f"SINE embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['SINE'][0]):.4f}")
+        
+    except ImportError as e:
+        print(f"Karate Club not available: {e}")
+        print("Installing Karate Club...")
+        
+        try:
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "pip", "install", "karateclub"], check=True)
+            print("Karate Club installed successfully!")
+            print("Please restart the script to use SINE")
+            raise RuntimeError("Please restart after Karate Club installation")
+            
+        except Exception as install_error:
+            print(f"Failed to install Karate Club: {install_error}")
+            print("Please install manually: pip install karateclub")
+            raise
     
+    except Exception as e:
+        print(f"Error with Karate Club SINE: {e}")
+        print("Falling back to simplified implementation...")
+        
+        # Simple fallback implementation
+        from sklearn.decomposition import TruncatedSVD
+        
+        # Combine structural and textual features
+        if hasattr(tf_idf, 'toarray'):
+            text_features = tf_idf.toarray()
+        else:
+            text_features = tf_idf
+            
+        # Use adjacency matrix as structural features
+        if hasattr(A, 'toarray'):
+            adj_features = A.toarray()
+        else:
+            adj_features = A
+        
+        # Apply dimensionality reduction
+        svd = TruncatedSVD(n_components=d, random_state=42)
+        
+        # Reduce text features
+        text_reduced = svd.fit_transform(text_features)
+        
+        # Use normalized adjacency as simplified structural features
+        adj_normalized = normalize(adj_features, norm='l2', axis=1)
+        struct_reduced = svd.fit_transform(adj_normalized)
+        
+        # Combine with equal weighting
+        alpha = 0.5
+        min_dims = min(text_reduced.shape[1], struct_reduced.shape[1])
+        combined = alpha * struct_reduced[:, :min_dims] + (1 - alpha) * text_reduced[:, :min_dims]
+        
+        # Normalize the combined embeddings
+        embeddings["SINE"] = normalize(combined, norm='l2', axis=1)
+        print(f"Fallback SINE embeddings shape: {embeddings['SINE'].shape}")
+        print(f"Fallback SINE embeddings norm check (should be ~1.0): {np.linalg.norm(embeddings['SINE'][0]):.4f}")
+    
+    print("\nSINE embeddings (normalized):")
+    print(embeddings["SINE"])
+# Print normalization summary
+print("\n" + "="*50)
+print("EMBEDDING NORMALIZATION SUMMARY")
+print("="*50)
+for method, emb in embeddings.items():
+    # Check a few random vectors to verify normalization
+    sample_norms = [np.linalg.norm(emb[i]) for i in range(min(5, len(emb)))]
+    avg_norm = np.mean(sample_norms)
+    print(f"{method}: Average norm = {avg_norm:.6f} (should be ~1.0)")
+    print(f"  Sample norms: {[f'{norm:.4f}' for norm in sample_norms]}")
+
+
+# Build NearestNeighbors index for retrieval
+neighbors_index = {}
+for method, emb in embeddings.items():
+    nbrs = NearestNeighbors(metric='cosine').fit(emb)
+    neighbors_index[method] = nbrs
+
+def comprehensive_evaluation(embeddings, A, raw_texts, k=5):
+    """
+    Évaluation complète incluant plusieurs documents de test
+    """
+    # 1. Sélectionner plusieurs documents test (différents degrés de connectivité)
+    graph_nx = nx.from_scipy_sparse_array(A)
+    degrees = dict(graph_nx.degree())
+    
+    # Documents avec différents niveaux de connectivité
+    high_degree_nodes = [node for node, deg in degrees.items() if deg >= 10]
+    medium_degree_nodes = [node for node, deg in degrees.items() if 3 <= deg < 10]
+    low_degree_nodes = [node for node, deg in degrees.items() if deg == 1]
+    
+    test_nodes = []
+    if high_degree_nodes: test_nodes.extend(np.random.choice(high_degree_nodes, min(3, len(high_degree_nodes)), replace=False))
+    if medium_degree_nodes: test_nodes.extend(np.random.choice(medium_degree_nodes, min(5, len(medium_degree_nodes)), replace=False))
+    if low_degree_nodes: test_nodes.extend(np.random.choice(low_degree_nodes, min(2, len(low_degree_nodes)), replace=False))
+    
+    print(f"Documents de test sélectionnés: {test_nodes}")
+    
+    # 2. Évaluation de similarité pour chaque document test
     all_results = []
     
-    for dataset_name in datasets:
-        print(f"\n{'='*50}")
-        print(f"Dataset: {dataset_name}")
-        print(f"{'='*50}")
+    for test_doc in test_nodes:
+        print(f"\n--- Évaluation pour le document {test_doc} ---")
+        doc_degree = degrees[test_doc]
+        print(f"Degré de connectivité: {doc_degree}")
         
-        try:
-            # Load dataset
-            graph = load_dataset(dataset_name)
-            labels_df = load_node_labels(dataset_name)
-            
-            print(f"Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
-            
-            # Ensure graph is connected (take largest component)
-            if not nx.is_connected(graph):
-                largest_cc = max(nx.connected_components(graph), key=len)
-                graph = graph.subgraph(largest_cc).copy()
-                print(f"Using largest connected component: {graph.number_of_nodes()} nodes")
-                
-                # Re-label nodes to be consecutive starting from 0
-                node_mapping = {node: i for i, node in enumerate(sorted(graph.nodes()))}
-                graph = nx.relabel_nodes(graph, node_mapping)
-                
-                # Update labels to match new node indexing
-                labels_df = labels_df[labels_df['node'].isin(node_mapping.keys())]
-                labels_df['node'] = labels_df['node'].map(node_mapping)
-                labels_df = labels_df.dropna()
-            
-            # Benchmark each model
-            for model_name, embedding_func in models:
-                result = benchmark_model(model_name, embedding_func, graph, labels_df)
-                result['dataset'] = dataset_name
-                all_results.append(result)
-                
-        except FileNotFoundError as e:
-            print(f"Dataset {dataset_name} not found: {e}")
-            continue
-        except Exception as e:
-            print(f"Error processing dataset {dataset_name}: {str(e)}")
-            continue
+        for method in embeddings:
+            result = retrieve_similar(test_doc, method, k)
+            result['test_doc'] = test_doc
+            result['test_doc_degree'] = doc_degree
+            all_results.append(result)
     
-    # Create results DataFrame and display
-    if all_results:
-        results_df = pd.DataFrame(all_results)
-        print(f"\n{'='*80}")
-        print("BENCHMARK RESULTS SUMMARY")
-        print(f"{'='*80}")
-        print(results_df.to_string(index=False))
+    # 3. Évaluation de la fracture sémantique
+    print("\n" + "="*60)
+    print("ÉVALUATION DE LA FRACTURE SÉMANTIQUE")
+    print("="*60)
+    
+    fracture_evaluator = SemanticFractureEvaluator(embeddings, A, raw_texts)
+    fracture_results = fracture_evaluator.comprehensive_evaluation()
+    
+    # 4. Analyse comparative
+    print("\n" + "="*60)
+    print("ANALYSE COMPARATIVE: BASELINE vs MÉTHODES AVEC LIENS")
+    print("="*60)
+    
+    # Comparer BASELINE vs autres méthodes
+    baseline_fracture = fracture_results['fracture_severity']['BASELINE_TFIDF']
+    
+    print(f"Baseline (TF-IDF) - Sévérité de fracture: {baseline_fracture['fracture_severity_index']:.4f}")
+    print("Amélioration apportée par les liens:")
+    
+    for method in embeddings:
+        if method != 'BASELINE_TFIDF':
+            method_fracture = fracture_results['fracture_severity'][method]
+            improvement = baseline_fracture['fracture_severity_index'] - method_fracture['fracture_severity_index']
+            print(f"  {method}: {improvement:.4f} ({improvement/baseline_fracture['fracture_severity_index']*100:.1f}% d'amélioration)")
+    
+    return {
+        'similarity_results': pd.concat(all_results, ignore_index=True),
+        'fracture_evaluation': fracture_results,
+        'test_nodes': test_nodes
+    }
+
+def retrieve_similar(doc_idx, method='RLE', k=3):
+    """Version améliorée avec plus d'informations"""
+    emb = embeddings[method]
+    nbrs = neighbors_index[method]
+    distances, indices = nbrs.kneighbors(emb[doc_idx].reshape(1, -1), n_neighbors=k + 1)
+    
+    # Drop the query itself
+    sim_idxs = indices[0][1:]
+    sim_dists = distances[0][1:]
+    
+    # Vérifier si les documents similaires sont liés dans le graphe
+    linked_status = []
+    for sim_idx in sim_idxs:
+        is_linked = A[doc_idx, sim_idx] > 0 or A[sim_idx, doc_idx] > 0
+        linked_status.append(is_linked)
+    
+    results = pd.DataFrame({
+        'method': [method] * k,
+        'query_idx': [doc_idx] * k,
+        'neighbor_idx': sim_idxs,
+        'cosine_distance': sim_dists,
+        'cosine_similarity': 1 - sim_dists,
+        'is_actually_linked': linked_status,  # NOUVEAU: information sur les liens réels
+        'text_snippet': [raw[i][:200] + "..." if len(raw[i]) > 200 else raw[i] for i in sim_idxs]
+    })
+    return results
+
+def analyze_link_preservation():
+    """
+    Analyse spécifique: combien de liens réels sont préservés dans les top-k ?
+    """
+    print("\n" + "="*60)
+    print("ANALYSE DE PRÉSERVATION DES LIENS")
+    print("="*60)
+    
+    graph_nx = nx.from_scipy_sparse_array(A)
+    
+    # Prendre tous les nœuds avec au moins 2 liens
+    connected_nodes = [node for node in graph_nx.nodes() if graph_nx.degree(node) >= 2]
+    sample_nodes = np.random.choice(connected_nodes, min(20, len(connected_nodes)), replace=False)
+    
+    link_preservation_results = {}
+    
+    for method in embeddings:
+        preserved_links = 0
+        total_possible_links = 0
         
-        # Save results
-        results_df.to_csv('benchmark_results.csv', index=False)
-        print(f"\nResults saved to benchmark_results.csv")
-    else:
-        print("No results to display. Please check that dataset files exist.")
+        for node in sample_nodes:
+            # Vrais voisins
+            true_neighbors = set(graph_nx.neighbors(node))
+            total_possible_links += len(true_neighbors)
+            
+            # Top-k voisins selon embedding
+            result = retrieve_similar(node, method, k=min(10, len(true_neighbors)*2))
+            found_neighbors = set(result['neighbor_idx'].tolist())
+            
+            # Intersection
+            preserved = len(true_neighbors.intersection(found_neighbors))
+            preserved_links += preserved
+        
+        preservation_rate = preserved_links / total_possible_links if total_possible_links > 0 else 0
+        link_preservation_results[method] = preservation_rate
+        
+        print(f"{method}: {preservation_rate:.4f} ({preservation_rate*100:.1f}% des liens préservés)")
+    
+    return link_preservation_results
 
-
-if __name__ == "__main__":
-    main()
+# Exécution de l'évaluation complète
+if __name__ == '__main__':
+    print("\n" + "="*70)
+    print("BENCHMARK COMPLET POUR L'ÉTUDE DE FRACTURE SÉMANTIQUE")
+    print("="*70)
+    
+    # 1. Évaluation complète
+    comprehensive_results = comprehensive_evaluation(embeddings, A, raw, k=5)
+    
+    # 2. Analyse de préservation des liens
+    link_preservation = analyze_link_preservation()
+    
+    # 3. Sauvegarde des résultats
+    comprehensive_results['similarity_results'].to_csv('comprehensive_similarity_results.csv', index=False)
+    
+    # Sauvegarder les résultats de fracture
+    fracture_summary = pd.DataFrame({
+        method: {
+            'fracture_severity': results['fracture_severity_index'],
+            'mean_linked_similarity': comprehensive_results['fracture_evaluation']['linked_similarity'][method]['mean_linked_similarity'],
+            'link_preservation_rate': link_preservation[method]
+        }
+        for method, results in comprehensive_results['fracture_evaluation']['fracture_severity'].items()
+    }).T
+    
+    fracture_summary.to_csv('fracture_analysis_summary.csv')
+    
+    print(f"\nRésultats sauvegardés:")
+    print("- comprehensive_similarity_results.csv")
+    print("- fracture_analysis_summary.csv")
+    
+    # 4. Conclusion
+    print("\n" + "="*60)
+    print("CONCLUSION DE L'ÉTUDE")
+    print("="*60)
+    
+    baseline_fracture = comprehensive_results['fracture_evaluation']['fracture_severity']['BASELINE_TFIDF']['fracture_severity_index']
+    best_method = min(comprehensive_results['fracture_evaluation']['fracture_severity'].items(), 
+                     key=lambda x: x[1]['fracture_severity_index'])
+    
+    improvement = (baseline_fracture - best_method[1]['fracture_severity_index']) / baseline_fracture * 100
+    
+    print(f"La méthode {best_method[0]} réduit la fracture sémantique de {improvement:.1f}% par rapport au baseline TF-IDF")
+    print(f"Fracture baseline: {baseline_fracture:.4f}")
+    print(f"Fracture {best_method[0]}: {best_method[1]['fracture_severity_index']:.4f}")
